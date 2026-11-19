@@ -1,0 +1,138 @@
+# 웹스윙 공개 빌드. 앱 코드와 서명 키는 비공개 저장소 tlsgusdlf33/A12 에 있고,
+# 이 파일은 A12_TOKEN(A12 읽기 전용 토큰)으로 그것을 받아 빌드만 한다.
+# 비밀 값은 로그에 출력하지 않는다. 마지막 단계에서 이 공개 저장소에 키·비밀 값·
+# 게임 코드가 섞여 들어오지 않았는지 검사한다.
+name: webswing-build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 이 공개 저장소의 릴리스와 gh-pages(OTA)에만 쓴다
+
+concurrency:
+  group: webswing-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out this public repo
+        uses: actions/checkout@v4
+        with:
+          path: public
+          fetch-depth: 0
+
+      - name: Check out the private app
+        uses: actions/checkout@v4
+        with:
+          repository: tlsgusdlf33/A12
+          token: ${{ secrets.A12_TOKEN }}
+          path: app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install
+        working-directory: app
+        run: npm ci --no-audit --no-fund
+
+      - name: Resolve update location
+        id: t
+        working-directory: app
+        run: |
+          base="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}"
+          rv="$(npx tsx -e "import {RUNTIME_VERSION} from './app.config'; process.stdout.write(RUNTIME_VERSION)")"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "rv=$rv" >> "$GITHUB_OUTPUT"
+
+      - name: Generate the native project and apply release signing
+        working-directory: app
+        env:
+          CI: '1'
+          EXPO_NO_TELEMETRY: '1'
+          UPDATES_BASE_URL: ${{ steps.t.outputs.base }}
+        run: |
+          npx expo prebuild --platform android --clean --no-install > /dev/null
+          python3 scripts/apply-release-signing.py
+          sed -i 's|^org.gradle.jvmargs=.*|org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=2048m -Dfile.encoding=UTF-8|' android/gradle.properties
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Build the APK
+        working-directory: app/android
+        env:
+          UPDATES_BASE_URL: ${{ steps.t.outputs.base }}
+        run: ./gradlew assembleRelease --no-daemon -q -PreactNativeArchitectures=arm64-v8a
+
+      - name: Check the APK
+        id: apk
+        run: |
+          apk="webswing-${GITHUB_SHA::7}.apk"
+          cp app/android/app/build/outputs/apk/release/app-release.apk "$apk"
+          aapt2="$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
+          signer="$(dirname "$aapt2")/apksigner"
+          unzip -l "$apk" | grep -q 'assets/index.android.bundle' || { echo "::error::JS bundle missing"; exit 1; }
+          "$signer" verify --print-certs "$apk" | grep -q 'CN=WebSwing' || { echo "::error::not signed with the release key"; exit 1; }
+          rv="$("$aapt2" dump resources "$apk" | grep -A1 'string/expo_runtime_version$' | tail -1 | sed 's/.*"\(.*\)".*/\1/')"
+          [ "$rv" = "${{ steps.t.outputs.rv }}" ] || { echo "::error::runtime version mismatch"; exit 1; }
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+          echo "APK $(du -h "$apk" | cut -f1), release-signed, runtime $rv"
+
+      - name: Publish the OTA update
+        working-directory: app
+        env:
+          CI: '1'
+          EXPO_NO_TELEMETRY: '1'
+          UPDATES_BASE_URL: ${{ steps.t.outputs.base }}
+        run: |
+          npx expo export --platform android --output-dir dist > /dev/null
+          npx tsx scripts/build-update-manifest.ts --dist dist --platform android \
+            --runtime-version '${{ steps.t.outputs.rv }}' \
+            --base-url '${{ steps.t.outputs.base }}/updates/${{ steps.t.outputs.rv }}' > /dev/null
+          bash scripts/publish-update.sh "$GITHUB_WORKSPACE/public" "$PWD/dist" '${{ steps.t.outputs.rv }}'
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "webswing-${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}" "${{ steps.apk.outputs.apk }}" \
+            --repo "$GITHUB_REPOSITORY" --title "웹스윙 빌드 ${GITHUB_RUN_NUMBER}" \
+            --notes "정식 키로 서명된 APK입니다. 임시 키로 서명된 이전 버전이 설치돼 있으면 한 번 지우고 설치하세요."
+
+      # 이 공개 저장소(main과 gh-pages)에 키·비밀 값·게임 코드가 없는지 검사한다.
+      # 발견되면 파일 이름만 남기고 내용은 출력하지 않은 채 빌드를 실패로 표시한다.
+      - name: Security scan of this public repo
+        working-directory: public
+        run: |
+          set -u
+          bad=0
+          git fetch -q origin main gh-pages 2>/dev/null || true
+          for ref in origin/main origin/gh-pages; do
+            git rev-parse -q --verify "$ref" >/dev/null || continue
+            files="$(git ls-tree -r --name-only "$ref")"
+            keys="$(printf '%s\n' "$files" | grep -iE '\.(jks|keystore|p12|pfx|pem|key)$|(^|/)(id_rsa|id_ed25519)|(^|/)\.env|signing\.properties|secrets/' || true)"
+            [ -n "$keys" ] && { echo "::error::$ref 에 키·비밀 파일이 있습니다:"; printf '%s\n' "$keys"; bad=1; }
+            if [ "$ref" = origin/main ]; then
+              code="$(printf '%s\n' "$files" | grep -vE '^\.github/' | grep -iE '(^|/)src/|\.(ts|tsx|js|jsx|kt|java)$|(^|/)package\.json$|app\.config\.' || true)"
+              [ -n "$code" ] && { echo "::error::$ref 에 게임 코드가 있습니다:"; printf '%s\n' "$code"; bad=1; }
+              for f in $(printf '%s\n' "$files" | grep '^\.github/'); do
+                if git show "$ref:$f" | grep -qiE '(password|passwd|storepass|keypass|token|secret)[a-z_]*[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+/_-]{8,}'; then
+                  echo "::error::빌드 파일에 비밀 값이 직접 적혀 있습니다: $f"; bad=1
+                fi
+              done
+            fi
+          done
+          [ "$bad" = 0 ] && echo "검사 통과" || exit 1
